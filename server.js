@@ -1,67 +1,80 @@
-import crypto from "crypto";
-import { parseString } from "xml2js";
+const express = require('express');
+const bodyParser = require('body-parser');
+const xml2js = require('xml2js');
+const crypto = require('crypto');
 
-const TOKEN = process.env.TOKEN;
-const AES_KEY = process.env.AES_KEY; // base64 key
-const AES_KEY_BUFFER = Buffer.from(AES_KEY + "=", "base64");
-const IV = AES_KEY_BUFFER.subarray(0, 16);
+const TOKEN = process.env.WECOM_TOKEN || "你的Token";
+const AES_KEY = process.env.WECOM_AESKEY || "你的EncodingAESKey";
+const AES_KEY_BUFFER = Buffer.from(AES_KEY + "=", 'base64');
+
+const app = express();
+app.use(bodyParser.text({ type: 'text/xml' }));
+
+// 企业微信验签函数
+function checkSignature(token, timestamp, nonce, msg_encrypt) {
+  const array = [token, timestamp, nonce, msg_encrypt].sort();
+  const str = array.join('');
+  const sha1 = crypto.createHash('sha1');
+  sha1.update(str);
+  return sha1.digest('hex');
+}
 
 // AES 解密
-function decryptMsg(msg_encrypt) {
-  const decipher = crypto.createDecipheriv("aes-256-cbc", AES_KEY_BUFFER, IV);
-  decipher.setAutoPadding(false);
-  let decrypted = Buffer.concat([
-    decipher.update(msg_encrypt, "base64"),
-    decipher.final(),
+function decryptMsg(encrypt) {
+  const aesCipher = crypto.createDecipheriv(
+    'aes-256-cbc',
+    AES_KEY_BUFFER,
+    AES_KEY_BUFFER.slice(0, 16)
+  );
+  aesCipher.setAutoPadding(false);
+
+  let decipheredBuff = Buffer.concat([
+    aesCipher.update(encrypt, 'base64'),
+    aesCipher.final()
   ]);
 
-  const pad = decrypted[decrypted.length - 1];
-  decrypted = decrypted.subarray(0, decrypted.length - pad);
+  const pad = decipheredBuff[decipheredBuff.length - 1];
+  decipheredBuff = decipheredBuff.slice(0, decipheredBuff.length - pad);
 
-  const contentLength = decrypted.readUInt32BE(16);
-  return decrypted.subarray(20, 20 + contentLength).toString();
+  const content = decipheredBuff.slice(16);
+  const msg_len = content.slice(0, 4).readUInt32BE(0);
+  const xmlContent = content.slice(4, 4 + msg_len).toString('utf-8');
+
+  return xmlContent;
 }
 
-export default function handler(req, res) {
+// GET 验证服务器（企业微信第一次配置 URL 时用）
+app.get('/', (req, res) => {
   const { msg_signature, timestamp, nonce, echostr } = req.query;
 
-  // 🔥 1. 企业微信 URL 验证（GET）
-  if (req.method === "GET") {
-    const signature = crypto
-      .createHash("sha1")
-      .update([TOKEN, timestamp, nonce, echostr].sort().join(""))
-      .digest("hex");
+  const signature = checkSignature(TOKEN, timestamp, nonce, echostr);
 
-    if (signature === msg_signature) {
-      console.log("企业微信验证成功");
-      return res.send(echostr); // 必须原样返回
-    } else {
-      console.log("企业微信验证失败");
-      return res.status(400).send("验证失败");
-    }
+  if (signature === msg_signature) {
+    return res.send(echostr);
+  } else {
+    return res.status(401).send("Invalid signature");
   }
+});
 
-  // 🔥 2. 消息回调（POST）
-  if (req.method === "POST") {
-    let xml = "";
-    req.on("data", (chunk) => (xml += chunk));
-    req.on("end", () => {
-      parseString(xml, (err, result) => {
-        if (err) return res.status(400).send("xml parse error");
+// POST 接收企业微信消息
+app.post('/', async (req, res) => {
+  try {
+    const xmlData = await xml2js.parseStringPromise(req.body);
+    const encrypt = xmlData.xml.Encrypt[0];
 
-        const encrypt = result.xml.Encrypt[0];
-        const decrypted = decryptMsg(encrypt);
+    const decryptedXML = decryptMsg(encrypt);
+    const msg = await xml2js.parseStringPromise(decryptedXML);
 
-        console.log("收到消息：", decrypted);
+    console.log("收到企业微信消息:", msg);
 
-        // 你可以在这里写自动回复逻辑…
-
-        return res.send("success");
-      });
-    });
-
-    return;
+    // 企业微信要求必须快速返回 "success"
+    res.send("success");
+  } catch (e) {
+    console.error("消息处理出错:", e);
+    res.send("success");  
   }
+});
 
-  res.status(405).send("Method Not Allowed");
-}
+// ❗不要 app.listen()
+// Vercel 要求导出 app 作为处理函数
+module.exports = app;
